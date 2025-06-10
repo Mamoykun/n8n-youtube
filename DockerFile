@@ -1,0 +1,118 @@
+FROM n8nio/n8n:latest
+
+USER root
+
+# Install FFmpeg dan dependencies
+RUN apk update && apk add --no-cache \
+    ffmpeg \
+    ffmpeg-dev \
+    imagemagick \
+    python3 \
+    py3-pip \
+    curl \
+    wget \
+    git \
+    nodejs \
+    npm \
+    bash \
+    jq
+
+# Install Node packages
+RUN npm install -g sharp canvas fluent-ffmpeg
+
+# Create directories
+RUN mkdir -p /home/node/scripts /home/node/videos /home/node/temp
+
+# Video creation script
+RUN cat << 'SCRIPT' > /home/node/scripts/create_video.sh
+#!/bin/bash
+set -e
+
+CONFIG_FILE=$1
+OUTPUT_DIR="/home/node/videos"
+TEMP_DIR="/home/node/temp/$(date +%s)"
+
+mkdir -p $OUTPUT_DIR $TEMP_DIR
+
+echo "Creating video from config: $CONFIG_FILE"
+
+# Parse JSON
+TITLE=$(cat $CONFIG_FILE | jq -r '.title // "Untitled Video"')
+SCENES=$(cat $CONFIG_FILE | jq -r '.scenes[] | @base64')
+OUTPUT_FILE="$OUTPUT_DIR/video_$(date +%s).mp4"
+
+SCENE_FILES=()
+SCENE_INDEX=0
+
+# Process each scene
+for scene in $SCENES; do
+    SCENE_DATA=$(echo $scene | base64 --decode)
+    
+    IMAGE_URL=$(echo $SCENE_DATA | jq -r '.image // ""')
+    DURATION=$(echo $SCENE_DATA | jq -r '.duration // 5')
+    TEXT=$(echo $SCENE_DATA | jq -r '.text // ""')
+    
+    echo "Processing scene $SCENE_INDEX..."
+    
+    # Download image
+    IMG_FILE="$TEMP_DIR/scene_${SCENE_INDEX}.jpg"
+    if [ ! -z "$IMAGE_URL" ]; then
+        curl -s -L -o $IMG_FILE "$IMAGE_URL" || {
+            # Fallback: create colored background
+            ffmpeg -f lavfi -i "color=c=blue:size=1920x1080:duration=1" -vframes 1 $IMG_FILE
+        }
+    else
+        ffmpeg -f lavfi -i "color=c=blue:size=1920x1080:duration=1" -vframes 1 $IMG_FILE
+    fi
+    
+    # Create scene video
+    SCENE_VIDEO="$TEMP_DIR/scene_${SCENE_INDEX}.mp4"
+    
+    if [ ! -z "$TEXT" ]; then
+        # With text overlay
+        ESCAPED_TEXT=$(echo "$TEXT" | sed "s/'/'\\\\\\\\''/g")
+        ffmpeg -y -loop 1 -i $IMG_FILE \
+            -vf "drawtext=text='$ESCAPED_TEXT':fontcolor=white:fontsize=32:box=1:boxcolor=black@0.7:boxborderw=5:x=(w-text_w)/2:y=h-th-50" \
+            -c:v libx264 -t $DURATION -pix_fmt yuv420p -r 30 $SCENE_VIDEO
+    else
+        # Without text
+        ffmpeg -y -loop 1 -i $IMG_FILE \
+            -c:v libx264 -t $DURATION -pix_fmt yuv420p -r 30 $SCENE_VIDEO
+    fi
+    
+    SCENE_FILES+=($SCENE_VIDEO)
+    SCENE_INDEX=$((SCENE_INDEX + 1))
+done
+
+# Concatenate scenes
+CONCAT_FILE="$TEMP_DIR/concat_list.txt"
+for file in "${SCENE_FILES[@]}"; do
+    echo "file '$file'" >> $CONCAT_FILE
+done
+
+ffmpeg -y -f concat -safe 0 -i $CONCAT_FILE -c copy "$OUTPUT_FILE"
+
+# Cleanup
+rm -rf $TEMP_DIR
+
+echo "Video created: $OUTPUT_FILE"
+echo "$OUTPUT_FILE"
+SCRIPT
+
+RUN chmod +x /home/node/scripts/create_video.sh
+
+# Entrypoint
+RUN cat << 'ENTRYPOINT' > /home/node/entrypoint.sh
+#!/bin/bash
+mkdir -p /home/node/videos /home/node/temp
+chown -R node:node /home/node/videos /home/node/temp /home/node/scripts
+exec su-exec node n8n start
+ENTRYPOINT
+
+RUN chmod +x /home/node/entrypoint.sh
+
+USER node
+WORKDIR /home/node
+EXPOSE 5678
+
+ENTRYPOINT ["/home/node/entrypoint.sh"]
